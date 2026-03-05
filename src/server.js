@@ -68,6 +68,20 @@ const COMPRESS_ROLES = new Set(
     .map((item) => item.trim())
     .filter(Boolean)
 );
+const LOG_LEVEL = (process.env.LOG_LEVEL ?? (LOCAL_TEST_MODE ? "debug" : "info")).toLowerCase();
+const LOG_BUFFER_SIZE = Number.parseInt(process.env.LOG_BUFFER_SIZE ?? "500", 10);
+const LOG_LOCAL_ENDPOINT =
+  process.env.NODE_ENV !== "production" &&
+  (process.env.LOG_LOCAL_ENDPOINT === "true" || LOCAL_TEST_MODE);
+
+const LOG_LEVEL_PRIORITY = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40
+};
+
+const logBuffer = [];
 
 const stats = {
   requests_total: 0,
@@ -100,6 +114,88 @@ function sendJson(res, statusCode, payload) {
   res.setHeader("content-type", "application/json");
   res.setHeader("content-length", Buffer.byteLength(body));
   res.end(body);
+}
+
+function getCurrentIsoTimestamp() {
+  return new Date().toISOString();
+}
+
+function getLogPriority(level) {
+  return LOG_LEVEL_PRIORITY[level] ?? LOG_LEVEL_PRIORITY.info;
+}
+
+function shouldLog(level) {
+  return getLogPriority(level) >= getLogPriority(LOG_LEVEL);
+}
+
+function redactString(input) {
+  if (typeof input !== "string") return input;
+  return input
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [REDACTED]")
+    .replace(/\bsk-or-[A-Za-z0-9_-]+\b/g, "[REDACTED]")
+    .replace(/\bttc_sk_[A-Za-z0-9_-]+\b/g, "[REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]");
+}
+
+function sanitizeForLogs(value, keyName = "") {
+  const lowerKey = keyName.toLowerCase();
+  const sensitiveKeys = new Set([
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "upstream_api_key",
+    "proxy_api_key",
+    "token_company_api_key"
+  ]);
+
+  if (sensitiveKeys.has(lowerKey)) {
+    return "[REDACTED]";
+  }
+
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") return redactString(value);
+  if (typeof value === "number" || typeof value === "boolean") return value;
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeForLogs(item));
+  }
+
+  if (typeof value === "object") {
+    const sanitized = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      sanitized[childKey] = sanitizeForLogs(childValue, childKey);
+    }
+    return sanitized;
+  }
+
+  return String(value);
+}
+
+function pushLogEvent(event) {
+  logBuffer.push(event);
+  const maxSize = Number.isFinite(LOG_BUFFER_SIZE) ? Math.max(1, LOG_BUFFER_SIZE) : 500;
+  if (logBuffer.length > maxSize) {
+    logBuffer.shift();
+  }
+}
+
+function logEvent(level, eventName, fields = {}) {
+  if (!shouldLog(level)) return;
+  const event = sanitizeForLogs({
+    timestamp: getCurrentIsoTimestamp(),
+    level,
+    event_name: eventName,
+    service: "token-company-proxy",
+    ...fields
+  });
+  pushLogEvent(event);
+  console.log(JSON.stringify(event));
 }
 
 function openAiError(message, type = "invalid_request_error", code = null) {
@@ -203,13 +299,33 @@ function buildTokenCompanyCompressUrl() {
   return `${base}/v1/compress`;
 }
 
-async function compressTextSafe(text) {
+function createRequestCompressionState() {
+  return {
+    enabled: ENABLE_COMPRESSION,
+    attempted_count: 0,
+    applied_count: 0,
+    fallback_count: 0,
+    skipped_count: 0,
+    input_chars_before: 0,
+    input_chars_after: 0,
+    reason_codes: []
+  };
+}
+
+function pushCompressionReason(state, reason) {
+  if (!reason) return;
+  state.reason_codes.push(reason);
+}
+
+async function compressTextSafe(text, requestCompression) {
   if (!ENABLE_COMPRESSION || !TOKEN_COMPANY_API_KEY) return { text, changed: false, reason: "disabled_or_missing_key" };
   if (text.length < COMPRESSION_MIN_CHARS) return { text, changed: false, reason: "below_threshold" };
   if (looksHighRiskForSafeMode(text)) return { text, changed: false, reason: "high_risk_content" };
 
   stats.compression_attempted_count += 1;
   stats.estimated_input_size_before += text.length;
+  requestCompression.attempted_count += 1;
+  requestCompression.input_chars_before += text.length;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TOKEN_COMPANY_TIMEOUT_MS);
@@ -245,6 +361,8 @@ async function compressTextSafe(text) {
     if (!response.ok) {
       stats.compression_fallback_count += 1;
       stats.last_error_code = `ttc_http_${response.status}`;
+      requestCompression.fallback_count += 1;
+      pushCompressionReason(requestCompression, `ttc_http_${response.status}`);
       return { text, changed: false, reason: "ttc_http_error" };
     }
 
@@ -252,30 +370,39 @@ async function compressTextSafe(text) {
     if (!payload || typeof payload.output !== "string") {
       stats.compression_fallback_count += 1;
       stats.last_error_code = "ttc_bad_payload";
+      requestCompression.fallback_count += 1;
+      pushCompressionReason(requestCompression, "ttc_bad_payload");
       return { text, changed: false, reason: "ttc_bad_payload" };
     }
 
     stats.estimated_input_size_after += payload.output.length;
+    requestCompression.input_chars_after += payload.output.length;
 
     if (payload.output.length >= text.length) {
       stats.compression_skipped_count += 1;
+      requestCompression.skipped_count += 1;
+      pushCompressionReason(requestCompression, "no_size_reduction");
       return { text, changed: false, reason: "no_size_reduction" };
     }
 
     stats.compression_applied_count += 1;
+    requestCompression.applied_count += 1;
+    pushCompressionReason(requestCompression, "compressed");
     return { text: payload.output, changed: true, reason: "compressed" };
   } catch {
     stats.compression_fallback_count += 1;
     stats.last_error_code = "ttc_request_failed";
+    requestCompression.fallback_count += 1;
+    pushCompressionReason(requestCompression, "ttc_request_failed");
     return { text, changed: false, reason: "ttc_request_failed" };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function maybeCompressMessageContent(content) {
+async function maybeCompressMessageContent(content, requestCompression) {
   if (typeof content === "string") {
-    return compressTextSafe(content);
+    return compressTextSafe(content, requestCompression);
   }
 
   if (Array.isArray(content)) {
@@ -289,7 +416,7 @@ async function maybeCompressMessageContent(content) {
         part.type === "text" &&
         typeof part.text === "string"
       ) {
-        const compressed = await compressTextSafe(part.text);
+        const compressed = await compressTextSafe(part.text, requestCompression);
         next.push({ ...part, text: compressed.text });
         if (compressed.changed) anyChanged = true;
       } else {
@@ -303,7 +430,7 @@ async function maybeCompressMessageContent(content) {
   return { text: content, changed: false, reason: "unsupported_content" };
 }
 
-async function maybeCompressChatPayload(payload) {
+async function maybeCompressChatPayload(payload, requestCompression) {
   if (!payload || typeof payload !== "object" || !Array.isArray(payload.messages)) {
     return { payload, changed: false };
   }
@@ -322,7 +449,7 @@ async function maybeCompressChatPayload(payload) {
       continue;
     }
 
-    const compressed = await maybeCompressMessageContent(message.content);
+    const compressed = await maybeCompressMessageContent(message.content, requestCompression);
     nextMessages.push({ ...message, content: compressed.text });
     if (compressed.changed) {
       changed = true;
@@ -345,9 +472,19 @@ async function maybeCompressChatPayload(payload) {
 async function handleChatCompletions(req, res) {
   const startedAt = Date.now();
   const requestId = randomUUID();
+  const traceId = String(req.headers["x-trace-id"] ?? "");
+  const requestCompression = createRequestCompressionState();
   stats.requests_total += 1;
 
   if (!isProxyAuthorized(req)) {
+    logEvent("warn", "proxy.request.failed", {
+      request_id: requestId,
+      trace_id: traceId,
+      method: req.method,
+      path: req.url,
+      status_code: 401,
+      outcome: "unauthorized"
+    });
     sendJson(res, 401, openAiError("Invalid proxy API key", "authentication_error", "invalid_api_key"));
     return;
   }
@@ -356,6 +493,14 @@ async function handleChatCompletions(req, res) {
   try {
     rawBody = await readRawBody(req);
   } catch {
+    logEvent("warn", "proxy.request.failed", {
+      request_id: requestId,
+      trace_id: traceId,
+      method: req.method,
+      path: req.url,
+      status_code: 400,
+      outcome: "invalid_body"
+    });
     sendJson(res, 400, openAiError("Failed to read request body", "invalid_request_error", "invalid_body"));
     return;
   }
@@ -363,7 +508,7 @@ async function handleChatCompletions(req, res) {
   const parsedBody = parseJsonBody(rawBody);
   if (parsedBody) {
     stats.requests_compression_eligible += 1;
-    const compressionResult = await maybeCompressChatPayload(parsedBody);
+    const compressionResult = await maybeCompressChatPayload(parsedBody, requestCompression);
     if (compressionResult.changed) {
       rawBody = Buffer.from(JSON.stringify(compressionResult.payload), "utf8");
       stats.requests_compression_applied += 1;
@@ -375,6 +520,14 @@ async function handleChatCompletions(req, res) {
   try {
     upstreamHeaders = buildUpstreamHeaders(req, requestId, rawBody.byteLength);
   } catch (error) {
+    logEvent("error", "proxy.request.failed", {
+      request_id: requestId,
+      trace_id: traceId,
+      method: req.method,
+      path: req.url,
+      status_code: 500,
+      outcome: "missing_upstream_key"
+    });
     sendJson(res, 500, openAiError(error.message, "server_error", "upstream_key_missing"));
     return;
   }
@@ -387,6 +540,14 @@ async function handleChatCompletions(req, res) {
       body: rawBody
     });
   } catch {
+    logEvent("error", "proxy.request.failed", {
+      request_id: requestId,
+      trace_id: traceId,
+      method: req.method,
+      path: req.url,
+      status_code: 502,
+      outcome: "upstream_unreachable"
+    });
     sendJson(res, 502, openAiError("Upstream request failed", "api_error", "upstream_unreachable"));
     return;
   }
@@ -403,15 +564,40 @@ async function handleChatCompletions(req, res) {
   }
 
   const durationMs = Date.now() - startedAt;
-  console.log(
-    JSON.stringify({
-      request_id: requestId,
-      method: req.method,
-      path: req.url,
-      upstream_status: upstreamRes.status,
-      duration_ms: durationMs
-    })
-  );
+  const reductionPct =
+    requestCompression.input_chars_before > 0
+      ? Number(
+          (
+            ((requestCompression.input_chars_before - requestCompression.input_chars_after) /
+              requestCompression.input_chars_before) *
+            100
+          ).toFixed(2)
+        )
+      : 0;
+
+  logEvent("info", "proxy.request.completed", {
+    request_id: requestId,
+    trace_id: traceId,
+    method: req.method,
+    path: req.url,
+    status_code: upstreamRes.status,
+    upstream_status_code: upstreamRes.status,
+    duration_ms: durationMs,
+    outcome: upstreamRes.status >= 400 ? "upstream_error" : "success",
+    compression: {
+      enabled: ENABLE_COMPRESSION,
+      attempted_count: requestCompression.attempted_count,
+      applied_count: requestCompression.applied_count,
+      fallback_count: requestCompression.fallback_count,
+      skipped_count: requestCompression.skipped_count,
+      reason_codes: Array.from(new Set(requestCompression.reason_codes)),
+      model: TOKEN_COMPANY_MODEL,
+      aggressiveness: TOKEN_COMPANY_AGGRESSIVENESS,
+      input_chars_before: requestCompression.input_chars_before,
+      input_chars_after: requestCompression.input_chars_after,
+      reduction_pct: reductionPct
+    }
+  });
 }
 
 function buildUpstreamChatCompletionsUrl() {
@@ -422,13 +608,42 @@ function buildUpstreamChatCompletionsUrl() {
   return `${base}/v1/chat/completions`;
 }
 
+function getFilteredLogs(urlObj) {
+  const level = String(urlObj.searchParams.get("level") ?? "").toLowerCase();
+  const requestId = String(urlObj.searchParams.get("request_id") ?? "");
+  const since = String(urlObj.searchParams.get("since") ?? "");
+  const limitRaw = Number.parseInt(urlObj.searchParams.get("limit") ?? "50", 10);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+
+  let filtered = [...logBuffer];
+  if (level) {
+    filtered = filtered.filter((event) => String(event.level) === level);
+  }
+  if (requestId) {
+    filtered = filtered.filter((event) => String(event.request_id ?? "") === requestId);
+  }
+  if (since) {
+    const sinceTs = Date.parse(since);
+    if (!Number.isNaN(sinceTs)) {
+      filtered = filtered.filter((event) => {
+        const ts = Date.parse(String(event.timestamp ?? ""));
+        return Number.isFinite(ts) && ts >= sinceTs;
+      });
+    }
+  }
+  return filtered.slice(-limit);
+}
+
 const server = createServer(async (req, res) => {
   if (!req.url || !req.method) {
     sendJson(res, 400, openAiError("Invalid request", "invalid_request_error", "bad_request"));
     return;
   }
 
-  if (req.method === "GET" && req.url === "/healthz") {
+  const urlObj = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
+  const path = urlObj.pathname;
+
+  if (req.method === "GET" && path === "/healthz") {
     sendJson(res, 200, {
       ok: true,
       service: "token-company-proxy",
@@ -437,7 +652,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url === "/stats") {
+  if (req.method === "GET" && path === "/stats") {
     sendJson(res, 200, {
       ...stats,
       compression_enabled: ENABLE_COMPRESSION,
@@ -447,7 +662,27 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "POST" && req.url === "/v1/chat/completions") {
+  if (req.method === "GET" && path === "/debug/logs") {
+    if (!LOG_LOCAL_ENDPOINT) {
+      sendJson(res, 404, openAiError("Endpoint not found", "invalid_request_error", "not_found"));
+      return;
+    }
+
+    if (!isProxyAuthorized(req)) {
+      sendJson(res, 401, openAiError("Invalid proxy API key", "authentication_error", "invalid_api_key"));
+      return;
+    }
+
+    const events = getFilteredLogs(urlObj);
+    sendJson(res, 200, {
+      total: logBuffer.length,
+      returned: events.length,
+      events
+    });
+    return;
+  }
+
+  if (req.method === "POST" && path === "/v1/chat/completions") {
     await handleChatCompletions(req, res);
     return;
   }
@@ -456,9 +691,13 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Proxy listening on http://localhost:${PORT}`);
-  console.log(`Upstream base URL: ${UPSTREAM_BASE_URL}`);
-  console.log(`Proxy auth required: ${PROXY_API_KEY ? "yes" : "no"}`);
-  console.log(`Local test mode: ${LOCAL_TEST_MODE ? "enabled" : "disabled"}`);
-  console.log(`Compression enabled: ${ENABLE_COMPRESSION ? "yes" : "no"}`);
+  logEvent("info", "proxy.server.started", {
+    listen_url: `http://localhost:${PORT}`,
+    upstream_base_url: UPSTREAM_BASE_URL,
+    proxy_auth_required: Boolean(PROXY_API_KEY),
+    local_test_mode: LOCAL_TEST_MODE,
+    compression_enabled: ENABLE_COMPRESSION,
+    log_level: LOG_LEVEL,
+    log_local_endpoint_enabled: LOG_LOCAL_ENDPOINT
+  });
 });

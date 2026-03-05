@@ -20,6 +20,7 @@ OpenAI-compatible proxy for IDE workflows (Cursor-compatible) that can apply saf
 - Fail-open behavior for all compression errors/timeouts
 - Token Company integration with optional gzip requests
 - Stats endpoint at `GET /stats` (no prompt content)
+- Local structured logs endpoint at `GET /debug/logs` (local mode only)
 
 ## Quick Start
 1. Copy env file and set keys:
@@ -46,6 +47,9 @@ OpenAI-compatible proxy for IDE workflows (Cursor-compatible) that can apply saf
 - `TOKEN_COMPANY_USE_GZIP` (default `true`)
 - `COMPRESSION_MIN_CHARS` (default `500`)
 - `COMPRESS_ROLES` (comma-separated, default `user`)
+- `LOG_LEVEL` (`debug|info|warn|error`)
+- `LOG_BUFFER_SIZE` (in-memory log ring size, default `500`)
+- `LOG_LOCAL_ENDPOINT` (enable `GET /debug/logs` in non-production)
 
 ## Local Test Mode
 - When `LOCAL_TEST_MODE=true` (or when `.env.local` exists and `NODE_ENV` is not `production`), the proxy loads `.env.local` first.
@@ -79,9 +83,20 @@ curl -s http://localhost:8080/v1/chat/completions \
 - Compression path is intentionally conservative for coding safety.
 - `.env.local` remains ignored and should never be committed.
 
+## Local Logs Endpoint
+- Endpoint: `GET /debug/logs`
+- Available only when `LOG_LOCAL_ENDPOINT=true` and not in production.
+- Requires proxy auth if `PROXY_API_KEY` is configured.
+- Query params:
+  - `level` (`debug|info|warn|error`)
+  - `request_id`
+  - `since` (ISO timestamp)
+  - `limit` (max `200`)
+
 ## Planning Docs
 - `docs/spec.md`
 - `docs/implementation-plan.md`
 - `docs/evaluation-plan.md`
 - `docs/decisions.md`
 - `docs/token-company-api-notes.md`
+- `docs/logging-instructions.txt`

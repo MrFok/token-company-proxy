@@ -238,3 +238,55 @@ test("falls back across providers using configured fallback rules", async () => 
     await new Promise((resolve) => backupServer.close(resolve));
   }
 });
+
+test("routes chat to provider base without /v1 for z.ai coding path", async () => {
+  const zAiPort = randomPort();
+  const proxyPort = randomPort();
+  let seenPath = "";
+
+  const zAiServer = createServer(async (req, res) => {
+    seenPath = String(req.url ?? "");
+    const payload = await readJsonBody(req);
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(completionResponse(payload.model, "from-zai")));
+  });
+
+  await once(zAiServer.listen(zAiPort), "listening");
+  const proxy = startProxy(proxyPort, `http://127.0.0.1:${zAiPort}`, {
+    UPSTREAM_PROVIDERS_JSON: JSON.stringify({
+      zai: {
+        baseURL: `http://127.0.0.1:${zAiPort}/api/coding/paas/v4`,
+        authMode: "client_bearer",
+        passThroughClientAuth: true
+      }
+    }),
+    MODEL_ROUTE_RULES_JSON: JSON.stringify([{ match: "prefix", value: "glm-", provider: "zai" }]),
+    MODEL_DEFAULT_PROVIDER: "zai"
+  });
+
+  try {
+    await waitForHealthy(proxyPort);
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer z-ai-token"
+      },
+      body: JSON.stringify({
+        model: "glm-4.7",
+        stream: false,
+        messages: [{ role: "user", content: "hello" }]
+      })
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(seenPath, "/api/coding/paas/v4/chat/completions");
+    const body = await response.json();
+    assert.equal(body.choices[0].message.content, "from-zai");
+  } finally {
+    proxy.kill("SIGTERM");
+    await once(proxy, "exit");
+    await new Promise((resolve) => zAiServer.close(resolve));
+  }
+});

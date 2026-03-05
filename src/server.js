@@ -1577,35 +1577,31 @@ async function handleEmbeddings(req, res) {
 }
 
 function buildUpstreamChatCompletionsUrl(providerConfig) {
-  const base = providerConfig.baseURL;
-  if (base.endsWith("/v1")) {
-    return `${base}/chat/completions`;
-  }
-  return `${base}/v1/chat/completions`;
+  return buildUpstreamEndpointUrl(providerConfig.baseURL, "/chat/completions");
 }
 
 function buildUpstreamModelsUrl(providerConfig) {
-  const base = providerConfig.baseURL;
-  if (base.endsWith("/v1")) {
-    return `${base}/models`;
-  }
-  return `${base}/v1/models`;
+  return buildUpstreamEndpointUrl(providerConfig.baseURL, "/models");
 }
 
 function buildUpstreamResponsesUrl(providerConfig) {
-  const base = providerConfig.baseURL;
-  if (base.endsWith("/v1")) {
-    return `${base}/responses`;
-  }
-  return `${base}/v1/responses`;
+  return buildUpstreamEndpointUrl(providerConfig.baseURL, "/responses");
 }
 
 function buildUpstreamEmbeddingsUrl(providerConfig) {
-  const base = providerConfig.baseURL;
-  if (base.endsWith("/v1")) {
-    return `${base}/embeddings`;
+  return buildUpstreamEndpointUrl(providerConfig.baseURL, "/embeddings");
+}
+
+function isOpenAiCompatibleRootWithoutV1(baseUrl) {
+  return /\/api\/(coding\/)?paas\/v4$/i.test(baseUrl);
+}
+
+function buildUpstreamEndpointUrl(baseUrl, endpointPath) {
+  const base = String(baseUrl ?? "").replace(/\/$/, "");
+  if (base.endsWith("/v1") || isOpenAiCompatibleRootWithoutV1(base)) {
+    return `${base}${endpointPath}`;
   }
-  return `${base}/v1/embeddings`;
+  return `${base}/v1${endpointPath}`;
 }
 
 function buildUpstreamRelayUrl(providerConfig, requestPathWithQuery) {

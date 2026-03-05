@@ -144,6 +144,29 @@ ENABLE_COMPRESSION=true
   - Set `PROXY_API_KEY_HEADER=x-proxy-key`
   - Send `X-Proxy-Key: <secret>` to proxy and keep `Authorization: Bearer <upstream-token>` for upstream.
 
+## OpenCode Harness Bridge (OAuth + Z.AI)
+- Use `opencode-plugins/tcc-proxy-bridge.js` to intercept OpenCode provider requests in-process and rewrite them to your local proxy.
+- Install plugin:
+  - `mkdir -p ~/.config/opencode/plugins`
+  - `cp opencode-plugins/tcc-proxy-bridge.js ~/.config/opencode/plugins/tcc-proxy-bridge.js`
+- Optional plugin env vars:
+  - `OC_PROXY_BRIDGE_BASE_URL` (default `http://127.0.0.1:8080`)
+  - `OC_PROXY_BRIDGE_TARGETS` (comma-separated upstream bases)
+  - `OC_PROXY_BRIDGE_DEBUG=true` (logs rewrites)
+- Run proxy with OpenAI + Z.AI provider routing:
+
+```env
+RELAY_MODE=single_base_url
+UPSTREAM_API_KEY=
+PROXY_API_KEY=
+UPSTREAM_PROVIDERS_JSON={"openai":{"baseURL":"https://api.openai.com","authMode":"client_bearer","passThroughClientAuth":true},"zai":{"baseURL":"https://api.z.ai/api/coding/paas/v4","authMode":"client_bearer","passThroughClientAuth":true}}
+MODEL_ROUTE_RULES_JSON=[{"match":"prefix","value":"gpt-","provider":"openai"},{"match":"prefix","value":"o","provider":"openai"},{"match":"prefix","value":"glm-","provider":"zai"}]
+MODEL_DEFAULT_PROVIDER=openai
+```
+
+- Result: OpenCode OAuth/OpenAI and Z.AI requests are intercepted by plugin, then routed through proxy, then forwarded upstream with original bearer credentials.
+- Note: if upstream returns `401` for OpenAI OAuth, the token audience/scope may not allow direct `api.openai.com` API usage even though routing works.
+
 ## Local Test Mode
 - When `LOCAL_TEST_MODE=true` (or when `.env.local` exists and `NODE_ENV` is not `production`), the proxy loads `.env.local` first.
 - `.env` is also loaded as fallback for missing values.

@@ -4,7 +4,7 @@ OpenAI-compatible proxy for IDE workflows (Cursor-compatible) that can apply saf
 
 ## Current Status
 - Milestone 1 implemented: baseline pass-through proxy
-- Compression not yet enabled (Milestone 2)
+- Milestone 2 implemented: safe-mode selective compression with fail-open fallback
 
 ## Milestone 1 Features
 - `POST /v1/chat/completions` OpenAI-compatible pass-through
@@ -12,6 +12,14 @@ OpenAI-compatible proxy for IDE workflows (Cursor-compatible) that can apply saf
 - Configurable upstream (`UPSTREAM_BASE_URL`, `UPSTREAM_API_KEY`)
 - Optional proxy auth (`PROXY_API_KEY`)
 - Health endpoint at `GET /healthz`
+
+## Milestone 2 Features
+- Safe-mode selective compression for `/v1/chat/completions` request messages
+- Conservative default: compress only `user` role content (`COMPRESS_ROLES` configurable)
+- High-risk content skip heuristics (code fences, diffs, stack traces, likely structured blobs)
+- Fail-open behavior for all compression errors/timeouts
+- Token Company integration with optional gzip requests
+- Stats endpoint at `GET /stats` (no prompt content)
 
 ## Quick Start
 1. Copy env file and set keys:
@@ -30,6 +38,14 @@ OpenAI-compatible proxy for IDE workflows (Cursor-compatible) that can apply saf
 - `PROXY_API_KEY` (optional, enables proxy-level auth)
 - `TOKEN_COMPANY_API_KEY` (used in Milestone 2)
 - `LOCAL_TEST_MODE` (`true` enables `.env.local` preference)
+- `ENABLE_COMPRESSION` (`true`/`false`)
+- `TOKEN_COMPANY_BASE_URL` (default `https://api.thetokencompany.com`)
+- `TOKEN_COMPANY_MODEL` (default `bear-1.2`)
+- `TOKEN_COMPANY_AGGRESSIVENESS` (default `0.1`)
+- `TOKEN_COMPANY_TIMEOUT_MS` (default `2500`)
+- `TOKEN_COMPANY_USE_GZIP` (default `true`)
+- `COMPRESSION_MIN_CHARS` (default `500`)
+- `COMPRESS_ROLES` (comma-separated, default `user`)
 
 ## Local Test Mode
 - When `LOCAL_TEST_MODE=true` (or when `.env.local` exists and `NODE_ENV` is not `production`), the proxy loads `.env.local` first.
@@ -59,9 +75,9 @@ curl -s http://localhost:8080/v1/chat/completions \
 ```
 
 ## Notes
-- This milestone is pass-through only. No prompt compression is applied yet.
-- Upstream compatibility target for this milestone is `/v1/chat/completions`.
-- `TOKEN_COMPANY_API_KEY` is used in Milestone 2 (compression), not Milestone 1.
+- Upstream compatibility target is currently `/v1/chat/completions`.
+- Compression path is intentionally conservative for coding safety.
+- `.env.local` remains ignored and should never be committed.
 
 ## Planning Docs
 - `docs/spec.md`

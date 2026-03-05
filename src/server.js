@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Readable } from "node:stream";
+import { gzipSync } from "node:zlib";
 
 function parseDotenv(fileContent) {
   const result = {};
@@ -53,6 +54,33 @@ const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const PROXY_API_KEY = process.env.PROXY_API_KEY ?? "";
 const UPSTREAM_BASE_URL = (process.env.UPSTREAM_BASE_URL ?? "https://api.openai.com").replace(/\/$/, "");
 const UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY ?? "";
+const ENABLE_COMPRESSION = process.env.ENABLE_COMPRESSION !== "false";
+const TOKEN_COMPANY_API_KEY = process.env.TOKEN_COMPANY_API_KEY ?? "";
+const TOKEN_COMPANY_BASE_URL = (process.env.TOKEN_COMPANY_BASE_URL ?? "https://api.thetokencompany.com").replace(/\/$/, "");
+const TOKEN_COMPANY_MODEL = process.env.TOKEN_COMPANY_MODEL ?? "bear-1.2";
+const TOKEN_COMPANY_AGGRESSIVENESS = Number.parseFloat(process.env.TOKEN_COMPANY_AGGRESSIVENESS ?? "0.1");
+const TOKEN_COMPANY_TIMEOUT_MS = Number.parseInt(process.env.TOKEN_COMPANY_TIMEOUT_MS ?? "2500", 10);
+const TOKEN_COMPANY_USE_GZIP = process.env.TOKEN_COMPANY_USE_GZIP !== "false";
+const COMPRESSION_MIN_CHARS = Number.parseInt(process.env.COMPRESSION_MIN_CHARS ?? "500", 10);
+const COMPRESS_ROLES = new Set(
+  (process.env.COMPRESS_ROLES ?? "user")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+);
+
+const stats = {
+  requests_total: 0,
+  requests_compression_eligible: 0,
+  requests_compression_applied: 0,
+  compression_attempted_count: 0,
+  compression_applied_count: 0,
+  compression_fallback_count: 0,
+  compression_skipped_count: 0,
+  estimated_input_size_before: 0,
+  estimated_input_size_after: 0,
+  last_error_code: null
+};
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -143,9 +171,181 @@ function copyUpstreamHeaders(upstreamRes, clientRes) {
   }
 }
 
+function parseJsonBody(buffer) {
+  try {
+    return JSON.parse(buffer.toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function looksHighRiskForSafeMode(text) {
+  if (!text) return false;
+  const highRiskPatterns = [
+    /```/, // fenced code
+    /^diff --git/m,
+    /^@@\s/m,
+    /^\+\+\+\s/m,
+    /^---\s/m,
+    /Traceback \(most recent call last\):/,
+    /Exception:/,
+    /^\s*\{[\s\S]*\}\s*$/m,
+    /^\s*\[[\s\S]*\]\s*$/m
+  ];
+  return highRiskPatterns.some((pattern) => pattern.test(text));
+}
+
+function buildTokenCompanyCompressUrl() {
+  const base = TOKEN_COMPANY_BASE_URL;
+  if (base.endsWith("/v1")) {
+    return `${base}/compress`;
+  }
+  return `${base}/v1/compress`;
+}
+
+async function compressTextSafe(text) {
+  if (!ENABLE_COMPRESSION || !TOKEN_COMPANY_API_KEY) return { text, changed: false, reason: "disabled_or_missing_key" };
+  if (text.length < COMPRESSION_MIN_CHARS) return { text, changed: false, reason: "below_threshold" };
+  if (looksHighRiskForSafeMode(text)) return { text, changed: false, reason: "high_risk_content" };
+
+  stats.compression_attempted_count += 1;
+  stats.estimated_input_size_before += text.length;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TOKEN_COMPANY_TIMEOUT_MS);
+  try {
+    const requestPayload = {
+      model: TOKEN_COMPANY_MODEL,
+      input: text,
+      compression_settings: {
+        aggressiveness: Number.isFinite(TOKEN_COMPANY_AGGRESSIVENESS) ? TOKEN_COMPANY_AGGRESSIVENESS : 0.1
+      }
+    };
+
+    let body;
+    const headers = {
+      authorization: `Bearer ${TOKEN_COMPANY_API_KEY}`,
+      "content-type": "application/json"
+    };
+
+    if (TOKEN_COMPANY_USE_GZIP) {
+      headers["content-encoding"] = "gzip";
+      body = gzipSync(Buffer.from(JSON.stringify(requestPayload), "utf8"));
+    } else {
+      body = JSON.stringify(requestPayload);
+    }
+
+    const response = await fetch(buildTokenCompanyCompressUrl(), {
+      method: "POST",
+      headers,
+      body,
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      stats.compression_fallback_count += 1;
+      stats.last_error_code = `ttc_http_${response.status}`;
+      return { text, changed: false, reason: "ttc_http_error" };
+    }
+
+    const payload = await response.json();
+    if (!payload || typeof payload.output !== "string") {
+      stats.compression_fallback_count += 1;
+      stats.last_error_code = "ttc_bad_payload";
+      return { text, changed: false, reason: "ttc_bad_payload" };
+    }
+
+    stats.estimated_input_size_after += payload.output.length;
+
+    if (payload.output.length >= text.length) {
+      stats.compression_skipped_count += 1;
+      return { text, changed: false, reason: "no_size_reduction" };
+    }
+
+    stats.compression_applied_count += 1;
+    return { text: payload.output, changed: true, reason: "compressed" };
+  } catch {
+    stats.compression_fallback_count += 1;
+    stats.last_error_code = "ttc_request_failed";
+    return { text, changed: false, reason: "ttc_request_failed" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function maybeCompressMessageContent(content) {
+  if (typeof content === "string") {
+    return compressTextSafe(content);
+  }
+
+  if (Array.isArray(content)) {
+    let anyChanged = false;
+    const next = [];
+
+    for (const part of content) {
+      if (
+        part &&
+        typeof part === "object" &&
+        part.type === "text" &&
+        typeof part.text === "string"
+      ) {
+        const compressed = await compressTextSafe(part.text);
+        next.push({ ...part, text: compressed.text });
+        if (compressed.changed) anyChanged = true;
+      } else {
+        next.push(part);
+      }
+    }
+
+    return { text: next, changed: anyChanged, reason: anyChanged ? "compressed" : "unchanged" };
+  }
+
+  return { text: content, changed: false, reason: "unsupported_content" };
+}
+
+async function maybeCompressChatPayload(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.messages)) {
+    return { payload, changed: false };
+  }
+
+  let changed = false;
+  const nextMessages = [];
+
+  for (const message of payload.messages) {
+    if (!message || typeof message !== "object") {
+      nextMessages.push(message);
+      continue;
+    }
+
+    if (!COMPRESS_ROLES.has(String(message.role ?? ""))) {
+      nextMessages.push(message);
+      continue;
+    }
+
+    const compressed = await maybeCompressMessageContent(message.content);
+    nextMessages.push({ ...message, content: compressed.text });
+    if (compressed.changed) {
+      changed = true;
+    }
+  }
+
+  if (!changed) {
+    return { payload, changed: false };
+  }
+
+  return {
+    payload: {
+      ...payload,
+      messages: nextMessages
+    },
+    changed: true
+  };
+}
+
 async function handleChatCompletions(req, res) {
   const startedAt = Date.now();
   const requestId = randomUUID();
+  stats.requests_total += 1;
 
   if (!isProxyAuthorized(req)) {
     sendJson(res, 401, openAiError("Invalid proxy API key", "authentication_error", "invalid_api_key"));
@@ -158,6 +358,16 @@ async function handleChatCompletions(req, res) {
   } catch {
     sendJson(res, 400, openAiError("Failed to read request body", "invalid_request_error", "invalid_body"));
     return;
+  }
+
+  const parsedBody = parseJsonBody(rawBody);
+  if (parsedBody) {
+    stats.requests_compression_eligible += 1;
+    const compressionResult = await maybeCompressChatPayload(parsedBody);
+    if (compressionResult.changed) {
+      rawBody = Buffer.from(JSON.stringify(compressionResult.payload), "utf8");
+      stats.requests_compression_applied += 1;
+    }
   }
 
   const upstreamUrl = buildUpstreamChatCompletionsUrl();
@@ -227,6 +437,16 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && req.url === "/stats") {
+    sendJson(res, 200, {
+      ...stats,
+      compression_enabled: ENABLE_COMPRESSION,
+      token_company_configured: Boolean(TOKEN_COMPANY_API_KEY),
+      compression_roles: Array.from(COMPRESS_ROLES)
+    });
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
     await handleChatCompletions(req, res);
     return;
@@ -240,4 +460,5 @@ server.listen(PORT, () => {
   console.log(`Upstream base URL: ${UPSTREAM_BASE_URL}`);
   console.log(`Proxy auth required: ${PROXY_API_KEY ? "yes" : "no"}`);
   console.log(`Local test mode: ${LOCAL_TEST_MODE ? "enabled" : "disabled"}`);
+  console.log(`Compression enabled: ${ENABLE_COMPRESSION ? "yes" : "no"}`);
 });

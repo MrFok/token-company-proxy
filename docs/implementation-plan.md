@@ -28,10 +28,13 @@ Ship in small, testable milestones:
 - Safe-mode protection for high-risk text regions.
 - Compression call to Token Company for eligible segments only.
 - Reassembly of request payload before upstream forwarding.
+- Use documented Token Company payload (`model`, `input`, `compression_settings.aggressiveness`).
+- Support optional gzip for compression requests.
 
 ### Done When
 - Compression applies to eligible prompt text only.
 - Protected regions remain unchanged.
+- Proxy can parse Token Company response (`output`, `output_tokens`, `original_input_tokens`).
 
 ## Milestone 3: Fail-Open and Robustness
 ### Deliverables

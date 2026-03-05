@@ -11,3 +11,4 @@ OpenAI-compatible proxy for IDE workflows (Cursor-compatible) that can apply saf
 - `docs/implementation-plan.md`
 - `docs/evaluation-plan.md`
 - `docs/decisions.md`
+- `docs/token-company-api-notes.md`

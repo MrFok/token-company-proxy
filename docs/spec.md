@@ -45,9 +45,24 @@ The product promise for v1 is:
 - OpenAI-compatible request/response pass-through for supported endpoints.
 - Configurable upstream base URL and upstream API key.
 - Configurable Token Company API key.
+- Token Company request format must follow documented API contract for `/v1/compress`.
 - Configurable compression thresholds and mode (`safe` default).
 - Request-level correlation ID for logging/troubleshooting.
 - Basic stats output for local validation.
+
+## Token Company Contract (v1)
+- Endpoint: `POST https://api.thetokencompany.com/v1/compress`
+- Auth header: `Authorization: Bearer <TOKEN_COMPANY_API_KEY>`
+- Request body fields:
+  - `model` (default `bear-1.2`)
+  - `input` (string)
+  - `compression_settings.aggressiveness` (float 0.0-1.0)
+- Expected response fields:
+  - `output` (compressed text)
+  - `output_tokens`
+  - `original_input_tokens`
+- Optional optimization: gzip request body using `Content-Encoding: gzip`.
+- Optional safety control: `<ttc_safe>...</ttc_safe>` tags for protected segments (feature marked experimental in docs).
 
 ## Safety Requirements
 - Protect high-risk structures from compression in safe mode:

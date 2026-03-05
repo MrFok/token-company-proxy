@@ -30,10 +30,12 @@ Use eval-driven iteration: test early, test often, and expand cases from real us
 - Compression API timeout -> original payload forwarded.
 - Compression API error -> original payload forwarded.
 - Partial compression failure in a request -> safe fallback behavior.
+- Unexpected compression response shape -> safe fallback behavior.
 
 ## E. Performance
 - Measure added latency from compression path.
 - Compare streaming start latency with and without compression.
+- Compare compression request performance with and without gzip.
 
 ## Metrics
 - `compression_attempted_count`

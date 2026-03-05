@@ -61,6 +61,8 @@ const TOKEN_COMPANY_MODEL = process.env.TOKEN_COMPANY_MODEL ?? "bear-1.2";
 const TOKEN_COMPANY_AGGRESSIVENESS = Number.parseFloat(process.env.TOKEN_COMPANY_AGGRESSIVENESS ?? "0.1");
 const TOKEN_COMPANY_TIMEOUT_MS = Number.parseInt(process.env.TOKEN_COMPANY_TIMEOUT_MS ?? "2500", 10);
 const TOKEN_COMPANY_USE_GZIP = process.env.TOKEN_COMPANY_USE_GZIP !== "false";
+const TOKEN_COMPANY_MAX_RETRIES = Number.parseInt(process.env.TOKEN_COMPANY_MAX_RETRIES ?? "1", 10);
+const TOKEN_COMPANY_RETRY_BACKOFF_MS = Number.parseInt(process.env.TOKEN_COMPANY_RETRY_BACKOFF_MS ?? "100", 10);
 const COMPRESSION_MIN_CHARS = Number.parseInt(process.env.COMPRESSION_MIN_CHARS ?? "500", 10);
 const COMPRESS_ROLES = new Set(
   (process.env.COMPRESS_ROLES ?? "user")
@@ -299,6 +301,10 @@ function buildTokenCompanyCompressUrl() {
   return `${base}/v1/compress`;
 }
 
+function sleep(ms) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
 function createRequestCompressionState() {
   return {
     enabled: ENABLE_COMPRESSION,
@@ -327,9 +333,13 @@ async function compressTextSafe(text, requestCompression) {
   requestCompression.attempted_count += 1;
   requestCompression.input_chars_before += text.length;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TOKEN_COMPANY_TIMEOUT_MS);
-  try {
+  const maxRetries = Number.isFinite(TOKEN_COMPANY_MAX_RETRIES) ? Math.max(0, TOKEN_COMPANY_MAX_RETRIES) : 1;
+  const maxAttempts = maxRetries + 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), TOKEN_COMPANY_TIMEOUT_MS);
+    try {
     const requestPayload = {
       model: TOKEN_COMPANY_MODEL,
       input: text,
@@ -359,6 +369,13 @@ async function compressTextSafe(text, requestCompression) {
     });
 
     if (!response.ok) {
+      const isRetriableStatus = response.status >= 500 || response.status === 429;
+      if (isRetriableStatus && attempt < maxAttempts) {
+        pushCompressionReason(requestCompression, `ttc_retry_http_${response.status}`);
+        await sleep(TOKEN_COMPANY_RETRY_BACKOFF_MS * attempt);
+        continue;
+      }
+
       stats.compression_fallback_count += 1;
       stats.last_error_code = `ttc_http_${response.status}`;
       requestCompression.fallback_count += 1;
@@ -389,15 +406,31 @@ async function compressTextSafe(text, requestCompression) {
     requestCompression.applied_count += 1;
     pushCompressionReason(requestCompression, "compressed");
     return { text: payload.output, changed: true, reason: "compressed" };
-  } catch {
-    stats.compression_fallback_count += 1;
-    stats.last_error_code = "ttc_request_failed";
-    requestCompression.fallback_count += 1;
-    pushCompressionReason(requestCompression, "ttc_request_failed");
-    return { text, changed: false, reason: "ttc_request_failed" };
-  } finally {
-    clearTimeout(timeout);
+    } catch (error) {
+      const timeoutError = error && error.name === "AbortError";
+      const reason = timeoutError ? "ttc_timeout" : "ttc_request_failed";
+
+      if (attempt < maxAttempts) {
+        pushCompressionReason(requestCompression, `ttc_retry_${reason}`);
+        await sleep(TOKEN_COMPANY_RETRY_BACKOFF_MS * attempt);
+        continue;
+      }
+
+      stats.compression_fallback_count += 1;
+      stats.last_error_code = reason;
+      requestCompression.fallback_count += 1;
+      pushCompressionReason(requestCompression, reason);
+      return { text, changed: false, reason };
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+
+  stats.compression_fallback_count += 1;
+  stats.last_error_code = "ttc_retry_exhausted";
+  requestCompression.fallback_count += 1;
+  pushCompressionReason(requestCompression, "ttc_retry_exhausted");
+  return { text, changed: false, reason: "ttc_retry_exhausted" };
 }
 
 async function maybeCompressMessageContent(content, requestCompression) {
@@ -647,7 +680,7 @@ const server = createServer(async (req, res) => {
     sendJson(res, 200, {
       ok: true,
       service: "token-company-proxy",
-      milestone: 1
+      milestone: 3
     });
     return;
   }

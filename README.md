@@ -22,6 +22,11 @@ OpenAI-compatible proxy for IDE workflows (Cursor-compatible) that can apply saf
 - Stats endpoint at `GET /stats` (no prompt content)
 - Local structured logs endpoint at `GET /debug/logs` (local mode only)
 
+## Milestone 3 Hardening
+- Compression retry policy for transient Token Company failures (`5xx`, `429`, timeouts)
+- Bounded retry/backoff with fail-open fallback after retry exhaustion
+- Integration tests for fail-open and retry success paths (`npm test`)
+
 ## Quick Start
 1. Copy env file and set keys:
    - `cp .env.example .env.local`
@@ -45,6 +50,8 @@ OpenAI-compatible proxy for IDE workflows (Cursor-compatible) that can apply saf
 - `TOKEN_COMPANY_AGGRESSIVENESS` (default `0.1`)
 - `TOKEN_COMPANY_TIMEOUT_MS` (default `2500`)
 - `TOKEN_COMPANY_USE_GZIP` (default `true`)
+- `TOKEN_COMPANY_MAX_RETRIES` (default `1`)
+- `TOKEN_COMPANY_RETRY_BACKOFF_MS` (default `100`)
 - `COMPRESSION_MIN_CHARS` (default `500`)
 - `COMPRESS_ROLES` (comma-separated, default `user`)
 - `LOG_LEVEL` (`debug|info|warn|error`)
@@ -82,6 +89,10 @@ curl -s http://localhost:8080/v1/chat/completions \
 - Upstream compatibility target is currently `/v1/chat/completions`.
 - Compression path is intentionally conservative for coding safety.
 - `.env.local` remains ignored and should never be committed.
+
+## Testing
+- Run integration tests:
+  - `npm test`
 
 ## Local Logs Endpoint
 - Endpoint: `GET /debug/logs`
